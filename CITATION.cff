@@ -1,0 +1,16 @@
+cff-version: 1.2.0
+message: "If you use this software, please cite the original paper."
+title: "bocd — Bayesian Online Change Point Detection"
+type: software
+license: MIT
+repository-code: "https://github.com/fiannai/bocd"
+references:
+  - type: article
+    authors:
+      - family-names: Adams
+        given-names: Ryan P.
+      - family-names: MacKay
+        given-names: David J. C.
+    title: "Bayesian Online Changepoint Detection"
+    year: 2007
+    url: "https://arxiv.org/abs/0710.3742"
