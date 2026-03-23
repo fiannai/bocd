@@ -21,7 +21,7 @@ Primary consumer: GLADyS memory service (episode boundary detection). But the li
 | Dependencies | numpy + scipy | scipy.stats gives clean model implementations; universal in data science |
 | Python version | 3.11+ | 3.10 EOL Oct 2026; 3.11 performance gains matter for numerics |
 | Architecture | Protocol-based composition + vectorized core | Modern, type-safe, extensible without inheritance; vectorized for performance |
-| Purity | Mutate-in-place by default, copy-on-demand | Fast path for streaming; pure path available via `model.copy()` |
+| Mutation | Mutate-in-place by default, snapshot-on-demand | Fast path for streaming; full state snapshot via `joint.copy()` + `model.copy()` |
 | Testing | TDD, unit + integration + property-based | Math is known upfront; tests-first catches implementation errors early |
 | Documentation | Docstrings + README + Jupyter notebook + Read the Docs | Full docs site is the mark of a serious library |
 | Build system | Hatch | Modern, PEP 621 native |
@@ -117,16 +117,27 @@ Sufficient statistics are numpy arrays indexed by run length, not object-per-hyp
 
 | Model | Sufficient Stats | Predictive Distribution |
 | --- | --- | --- |
-| Gaussian (NIG) | `sum_x`, `sum_x2`, `count` — each shape `(t,)` | Student-t: df=2α, loc=μ₀, scale=β·(κ+1)/(α·κ) (prior form; posterior substitutes updated hyperparameters per standard NIG conjugate update rules) |
-| Student-t | Same NIG stats, default α=0.5 (df=1, Cauchy-like tails) | Student-t with heavier tails than Gaussian default |
+| Gaussian (NIG) | `sum_x`, `sum_x2`, `count` — each shape `(t,)` | Student-t: df=2α, loc=μ_n, scale=sqrt(β_n·(κ_n+1)/(α_n·κ_n)) — scale is the scipy-compatible std-dev parameter (see NIG update equations below) |
+| Student-t (preset) | Same NIG stats via delegation to GaussianModel, default α=0.5 (df=1, Cauchy-like tails) | Student-t with heavier tails than Gaussian default |
 | Poisson (Gamma) | `sum_x`, `count` — each shape `(t,)` | Negative Binomial: r=α+sum_x, p=(β+count)/(β+count+1) |
 
 All operations are numpy broadcasts — no Python loop over run lengths. This is the 10-100x performance advantage over naive implementations.
 
+#### NIG Posterior Update Equations
+
+After observing x, the Normal-Inverse-Gamma hyperparameters update as:
+
+- `μ_n = (κ · μ₀ + n · x̄) / (κ + n)` — posterior mean shifts toward data mean
+- `κ_n = κ + n` — precision of mean estimate increases
+- `α_n = α + n/2` — degrees of freedom increase
+- `β_n = β + ½ · Σ(xᵢ − x̄)² + (κ · n · (x̄ − μ₀)²) / (2 · (κ + n))` — posterior scale absorbs data variance and prior-data conflict
+
+In the vectorized implementation, these are computed from sufficient statistics (`sum_x`, `sum_x2`, `count`) per run-length hypothesis. The predictive Student-t uses `scipy.stats.t(df=2α_n, loc=μ_n, scale=sqrt(β_n·(κ_n+1)/(α_n·κ_n)))`.
+
 ### Numerical Stability
 
 - **Log-space arithmetic** throughout — all probability computations use log-probabilities to avoid underflow on long series. `scipy.special.logsumexp` for normalization.
-- **Run-length truncation** — optional `max_run_length` parameter on `Detector` caps the distribution after each `step()` call. Tail mass is folded into the longest retained run length. The core `step()` function is unaware of truncation — this is the Detector layer's responsibility. Essential for infinite streams.
+- **Run-length truncation** — optional `max_run_length` parameter on `Detector` caps the distribution after each `step()` call. Hypotheses beyond the limit are discarded and the distribution is renormalized. The core `step()` function is unaware of truncation — this is the Detector layer's responsibility. Essential for infinite streams. When active, `Result.run_length_posterior` has shape `(min(step+1, max_run_length),)` rather than `(step+1,)`.
 - **Minimum probability floor** — small epsilon prevents log(0) in edge cases.
 
 ### Core Function Signatures
@@ -140,7 +151,8 @@ def step(
 ) -> tuple[NDArray[np.float64], float]:
     """Single BOCD step. Returns (new_joint, changepoint_probability).
 
-    Pure function — no side effects except model.update().
+    Mutates model via model.update(). All other arguments are not
+    modified — new_joint is a fresh array.
     """
 
 def run(
@@ -148,21 +160,32 @@ def run(
     model: ObservationModel,
     hazard: HazardFunction,
 ) -> tuple[NDArray[np.float64], list[NDArray[np.float64]]]:
-    """Batch mode. Returns (changepoint_probs, run_length_posteriors)."""
+    """Batch mode. Returns (changepoint_probs, run_length_posteriors).
+
+    Lower-level API — does not reset model state or apply truncation.
+    Callers must provide a fresh/reset model. For managed batch
+    processing with reset and truncation, use Detector.fit().
+    """
 ```
 
-### Purity Model
+### Mutation and Snapshotting
 
-`step()` mutates the observation model's sufficient statistics in place for performance. Users who need pure operation call `model.copy()` before stepping:
+`step()` mutates the observation model's sufficient statistics in place for performance. Users who need to snapshot state for branching or analysis must capture both the model and the joint distribution — `model.copy()` alone is not a complete BOCD checkpoint:
 
 ```python
 # Fast path (streaming, production)
 result = step(x, joint, model, hazard)
 
-# Pure path (analysis, branching, checkpointing)
-snapshot = model.copy()
+# Model snapshot (captures model state only)
+model_snapshot = model.copy()
 result = step(x, joint, model, hazard)
-# snapshot is untouched
+# model_snapshot is untouched, but joint has changed
+
+# Full state snapshot (captures complete BOCD state)
+joint_snapshot = joint.copy()
+model_snapshot = model.copy()
+result = step(x, joint, model, hazard)
+# Both snapshots are untouched — full branch point
 ```
 
 Performance cost of copying scales with series length (O(t) arrays). Negligible for series under ~1000 steps; infeasible for infinite streams.
@@ -196,7 +219,12 @@ class ObservationModel(Protocol):
 @runtime_checkable
 class HazardFunction(Protocol):
     def __call__(self, run_lengths: NDArray[np.int64]) -> NDArray[np.float64]:
-        """P(changepoint | run_length) for each hypothesis."""
+        """P(changepoint | run_length) for each hypothesis.
+
+        Must return values in [0, 1]. Values outside this range
+        produce invalid probabilities in the growth/changepoint
+        equations.
+        """
         ...
 ```
 
@@ -210,7 +238,7 @@ Normal-Inverse-Gamma conjugate prior. Hyperparameters: `mu_0`, `kappa`, `alpha`,
 
 ### StudentTModel
 
-Same NIG conjugate structure as `GaussianModel` with different default hyperparameters: `alpha=0.5` (giving df=1, Cauchy-like tails) vs. Gaussian's `alpha=1.0` (df=2). The lower degrees of freedom produce heavier tails, making the predictive distribution less sensitive to outliers and reducing false changepoint detections from extreme observations. All other mechanics (sufficient statistics, update logic) are identical — `StudentTModel` is effectively a robust preset of the NIG conjugate. Use for data with occasional spikes (network traffic, sensor data).
+A robust-prior preset of `GaussianModel`, not a distinct model family. Implemented as a thin subclass (or factory) that delegates all conjugate math to `GaussianModel` with `alpha=0.5` (giving df=1, Cauchy-like tails) vs. Gaussian's default `alpha=1.0` (df=2). The lower degrees of freedom produce heavier tails, making the predictive distribution less sensitive to outliers and reducing false changepoint detections from extreme observations. No duplicate conjugate math — `StudentTModel` inherits or delegates everything from `GaussianModel`. Kept as a separate importable name (`from bocd.models import StudentTModel`) for discoverability. Use for data with occasional spikes (network traffic, sensor data).
 
 ### PoissonModel
 
@@ -224,13 +252,17 @@ Constant hazard rate (memoryless / geometric prior on run length). Parameter: `r
 
 ### Custom Hazard
 
-Any callable satisfying the `HazardFunction` Protocol works — no class needed. This is the extension point for time-dependent hazards (Weibull, logistic, etc.):
+Any callable satisfying the `HazardFunction` Protocol works — no class needed. This is the extension point for run-length-dependent hazards (e.g., Weibull or logistic survival functions parameterized as functions of run length). Note: the Protocol accepts only `run_lengths`, not absolute time or observation spacing — hazards that depend on wall-clock time or irregular intervals require wrapping external state in a closure or class:
 
 ```python
-# Hazard that decreases as run length grows
-detector = Detector(model=m, hazard=lambda rl: 1 / (rl + 200))
+# Typed callable — preferred for mypy strict
+def decreasing_hazard(run_lengths: NDArray[np.int64]) -> NDArray[np.float64]:
+    """Hazard that decreases as run length grows."""
+    return 1 / (run_lengths + 200)
 
-# Increasing hazard (changepoints more likely over time)
+detector = Detector(model=m, hazard=decreasing_hazard)
+
+# Lambda shorthand — works at runtime but mypy cannot infer types
 detector = Detector(model=m, hazard=lambda rl: 1 - np.exp(-rl / 100))
 ```
 
@@ -242,12 +274,12 @@ detector = Detector(model=m, hazard=lambda rl: 1 - np.exp(-rl / 100))
 @dataclass(frozen=True, slots=True)
 class Result:
     changepoint_prob: float        # P(run_length = 0)
-    run_length_posterior: NDArray   # Full distribution, shape (step+1,) — one entry per possible run length 0..step
+    run_length_posterior: NDArray   # Full distribution — shape (step+1,) when unbounded, (min(step+1, max_run_length),) when truncated
     most_likely_run_length: int    # argmax of posterior
     step: int                      # 0-indexed observation number
 ```
 
-`frozen=True` — immutable, safe to store and pass around. `slots=True` — low memory footprint for batch collection.
+`frozen=True` — immutable, safe to store and pass around. `slots=True` — low memory footprint for batch collection. Each `Result` contains an independent copy of the posterior array (not a view into Detector internals), so results remain valid after subsequent `update()` calls and can be safely collected in batch mode.
 
 ### Detector Class
 
@@ -255,11 +287,18 @@ class Result:
 class Detector:
     def __init__(
         self,
-        model: ObservationModel = GaussianModel(),
-        hazard: HazardFunction = ConstantHazard(),
+        model: ObservationModel | None = None,
+        hazard: HazardFunction | None = None,
         *,
         max_run_length: int | None = None,
-    ) -> None: ...
+    ) -> None:
+        """Initialize detector.
+
+        Defaults to GaussianModel() + ConstantHazard() when called
+        with no arguments. Fresh instances are created per Detector
+        to avoid shared mutable state across detectors.
+        """
+        ...
 
     # Streaming
     def update(self, x: float) -> Result: ...
@@ -277,11 +316,11 @@ class Detector:
 
 ### Design Decisions
 
-- **`Detector()` works with zero arguments** — GaussianModel + ConstantHazard(1/200) as defaults. Two lines from import to changepoint detection.
+- **`Detector()` works with zero arguments** — defaults to `GaussianModel()` + `ConstantHazard(1/200)`, instantiated fresh inside `__init__` to avoid Python's mutable-default-argument pitfall. Two lines from import to changepoint detection.
 - **`fit()` resets state** — prevents leftover-state bugs in batch mode. Use `update()` in a loop to continue from existing state.
 - **`fit()` returns `list[Result]`** — standard Python type, works with all existing tooling.
-- **`fit()` calls `step()` in a loop** — resets state, then calls `_core.step()` for each observation, wrapping each step's output in a `Result`. The core `run()` function exists as a lower-level batch API returning raw arrays for users who want to avoid `Result` overhead.
-- **`run_length_posterior` property returns a copy** — prevents accidental mutation of internal state. `Result.run_length_posterior` should be treated as read-only by convention (frozen dataclass prevents attribute reassignment but not array mutation).
+- **`fit()` calls `step()` in a loop** — resets state, then calls `_core.step()` for each observation, applying truncation per step and wrapping each step's output in a `Result`. The core `run()` function exists as a lower-level batch API returning raw arrays for users who want to avoid `Result` overhead — it does not reset or truncate, so callers must provide a fresh model.
+- **`run_length_posterior` property returns a copy** — prevents accidental mutation of internal state. `Result.run_length_posterior` is an independent copy created at construction time — safe to store, but users should treat it as read-only by convention (frozen dataclass prevents attribute reassignment but not array mutation).
 - **No `predict()` method** — BOCD detects, it doesn't forecast. Keeps the library focused.
 
 ### Usage Examples
@@ -345,7 +384,7 @@ Tests are written before implementation. The algorithm's math is fully specified
 - Posterior always sums to 1.0 (±epsilon) for arbitrary inputs
 - No NaN or Inf in output for any finite input
 - `changepoint_prob` always in [0, 1]
-- `run_length_posterior` shape matches `step + 1`
+- `run_length_posterior` shape matches `step + 1` (unbounded) or `min(step + 1, max_run_length)` (truncated)
 - Empty or single-observation series don't crash
 - Extreme values produce valid output
 - `copy()` is truly independent
@@ -423,7 +462,7 @@ on tag (v*):
 
 ## Extension Example
 
-No inheritance required — implement the Protocol methods:
+No inheritance required — implement the Protocol methods. Note: the core algorithm calls `log_predictive_prob(x)` before `update(x)` within each step, so predictive probabilities are computed against the current state before the observation is incorporated:
 
 ```python
 class ExponentialModel:
