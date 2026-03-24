@@ -8,7 +8,9 @@
 
 A standalone, pip-installable Python library implementing the Adams & MacKay (2007) Bayesian Online Change Point Detection algorithm. Designed to be the community-standard BOCD implementation on PyPI — easy defaults, full extensibility, production-grade quality.
 
-Primary consumer: GLADyS memory service (episode boundary detection). But the library has no GLADyS awareness — it's a general-purpose tool for detecting regime changes in any time series.
+Scope: univariate time series. All observation inputs are scalar (`float`). Multivariate extension is a potential future direction.
+
+Primary consumer: GLADyS memory service (episode boundary detection). But the library has no GLADyS awareness — it's a general-purpose tool for detecting regime changes in any univariate time series.
 
 ## Decisions Log
 
@@ -35,7 +37,7 @@ Primary consumer: GLADyS memory service (episode boundary detection). But the li
 
 Three layers with strict separation of concerns:
 
-1. **Core (`_core.py`)** — pure functions implementing the BOCD algorithm on numpy arrays. No state management, no side effects except controlled model mutation. Independently testable.
+1. **Core (`_core.py`, re-exported as `bocd.core`)** — pure functions implementing the BOCD algorithm on numpy arrays. No state management, no side effects except controlled model mutation. Independently testable. The public `bocd.core` namespace provides an explicit import path for advanced users who want the unmanaged API.
 2. **Protocols & Models (`_typing.py`, `models/`, `hazards/`)** — extension contracts (Protocols) and built-in implementations. Each model is a self-contained file with its own conjugate math.
 3. **Detector (`detector.py`)** — stateful wrapper providing the public streaming and batch API. Thin layer over the core.
 
@@ -55,6 +57,8 @@ hazards/*            (implement HazardFunction Protocol)
 ```
 
 No cycles. Core has zero internal dependencies.
+
+`__init__.py` re-exports: `Detector`, `Result`, `GaussianModel`, `StudentTModel`, `PoissonModel`, `ConstantHazard`, `ObservationModel`, `HazardFunction`. All public names are importable from the top-level `bocd` package. Submodule imports (`from bocd.models import GaussianModel`) also work.
 
 ### Package Structure
 
@@ -167,7 +171,7 @@ Two-tier validation policy matching the library's layered architecture:
 **Core layer (unmanaged API):**
 - `_core.step()` and `_core.run()` do not validate inputs. Callers are responsible for ensuring finite values and correct types. Non-finite inputs will propagate through sufficient statistics and silently corrupt model state. This keeps the core layer fast for callers who have already validated upstream.
 
-**Model-specific domain constraints** are not enforced at the Detector level — for example, PoissonModel expects non-negative observations but `Detector.update(-1.0)` will not raise (it passes the finiteness check). Model-specific input validation is a candidate for a future version. Until then, domain constraints are the caller's responsibility and are documented per model.
+**Model-specific domain validation:** After the finiteness check, Detector calls `model.validate_observation(x)` before processing. Built-in models use this to enforce domain constraints (e.g., PoissonModel rejects `x < 0`). Custom models may override with their own domain checks or leave the default no-op. Core functions do not call `validate_observation()` — domain validation at the core layer is the caller's responsibility.
 
 ### Core Function Signatures
 
@@ -257,6 +261,16 @@ class ObservationModel(Protocol):
         """
         ...
 
+    def validate_observation(self, x: float) -> None:
+        """Validate that x is in this model's input domain.
+
+        Default: no-op (accepts all finite values). Override to
+        enforce model-specific constraints. Called by Detector
+        after finiteness check, before _core.step().
+        Raises ValueError if x is invalid for this model.
+        """
+        ...
+
 
 @runtime_checkable
 class HazardFunction(Protocol):
@@ -276,21 +290,21 @@ class HazardFunction(Protocol):
 
 ### GaussianModel
 
-Normal-Inverse-Gamma conjugate prior. Default hyperparameters: `mu_0=0.0` (prior mean), `kappa=1.0` (prior precision weight), `alpha=1.0` (shape — gives df=2 for predictive Student-t), `beta=1.0` (scale). Predictive distribution is Student-t. Use for continuous data with roughly normal variation within a regime (temperatures, latencies, stock returns).
+Normal-Inverse-Gamma conjugate prior. Default hyperparameters: `mu_0=0.0` (prior mean), `kappa=1.0` (prior precision weight), `alpha=1.0` (shape — gives df=2 for predictive Student-t), `beta=1.0` (scale). Constructor validates: `kappa > 0`, `alpha > 0`, `beta > 0` — raises `ValueError` if violated. Predictive distribution is Student-t. Use for continuous data with roughly normal variation within a regime (temperatures, latencies, stock returns).
 
 ### StudentTModel
 
-A robust-prior preset of `GaussianModel`, not a distinct model family. Implemented as a subclass of `GaussianModel` that overrides `alpha` to 0.5. Accepts the same constructor parameters as `GaussianModel` (`mu_0`, `kappa`, `alpha`, `beta`) but defaults `alpha=0.5` (giving df=1, Cauchy-like tails) vs. Gaussian's default `alpha=1.0` (df=2). The lower degrees of freedom produce heavier tails, making the predictive distribution less sensitive to outliers and reducing false changepoint detections from extreme observations. No duplicate conjugate math — `StudentTModel` inherits or delegates everything from `GaussianModel`. Kept as a separate importable name (`from bocd.models import StudentTModel`) for discoverability. Use for data with occasional spikes (network traffic, sensor data).
+A robust-prior preset of `GaussianModel`, not a distinct model family. Implemented as a subclass of `GaussianModel` that overrides `alpha` to 0.5. Accepts the same constructor parameters as `GaussianModel` (`mu_0`, `kappa`, `alpha`, `beta`) but defaults `alpha=0.5` (giving df=1, Cauchy-like tails) vs. Gaussian's default `alpha=1.0` (df=2). The lower degrees of freedom produce heavier tails, making the predictive distribution less sensitive to outliers and reducing false changepoint detections from extreme observations. No duplicate conjugate math — `StudentTModel` inherits or delegates everything from `GaussianModel`. Equivalent to `GaussianModel(alpha=0.5)` — provided as a separate importable name (`from bocd.models import StudentTModel`) for discoverability. Use for data with occasional spikes (network traffic, sensor data).
 
 ### PoissonModel
 
-Gamma-Poisson conjugate prior. Hyperparameters: `alpha`, `beta`. Predictive distribution is Negative Binomial. Accepts non-negative observations (counts). Negative values are mathematically invalid for the Gamma-Poisson conjugate and produce undefined results — input domain validation is the caller's responsibility (see Input Validation). Use for count/rate data — events per time window, requests per second, error counts.
+Gamma-Poisson conjugate prior. Hyperparameters: `alpha`, `beta`. Constructor validates: `alpha > 0`, `beta > 0` — raises `ValueError` if violated. Predictive distribution is Negative Binomial. Accepts non-negative observations (counts). `validate_observation()` rejects `x < 0` with `ValueError`. Use for count/rate data — events per time window, requests per second, error counts.
 
 ## Built-in Hazard Functions
 
 ### ConstantHazard
 
-Constant hazard rate (memoryless / geometric prior on run length). Parameter: `rate` (default `1/200`) = `1/expected_run_length`. Changepoints are equally likely at any run length. This is the standard hazard function from Adams & MacKay 2007 and covers the vast majority of use cases.
+Constant hazard rate (memoryless / geometric prior on run length). Parameter: `rate` (default `1/200`). Constructor validates: `0 < rate < 1` — raises `ValueError` if violated. `rate = 1 / expected_run_length` — if you expect ~200 observations between changepoints, use `rate=1/200`. Changepoints are equally likely at any run length. This is the standard hazard function from Adams & MacKay 2007 and covers the vast majority of use cases.
 
 ### Custom Hazard
 
@@ -371,6 +385,13 @@ class Detector:
         empty input. Raises TypeError if observations is not a 1-D
         numeric array. Raises ValueError if any value is non-finite.
         On validation failure, detector state is unchanged."""
+        ...
+
+    # Snapshot
+    def copy(self) -> "Detector":
+        """Independent clone: copied joint, copied model, same hazard
+        reference, same max_run_length, same step_count. The clone
+        and original can evolve independently."""
         ...
 
     # Inspection
@@ -560,9 +581,23 @@ class ExponentialModel:
         self._sum_x = self._sum_x[:max_len]
         self._count = self._count[:max_len]
 
+    def validate_observation(self, x: float) -> None:
+        if x < 0:
+            raise ValueError(f"ExponentialModel requires x >= 0, got {x}")
+
 # Works immediately:
 detector = Detector(model=ExponentialModel(), hazard=ConstantHazard())
 ```
+
+## Future Enhancements
+
+Candidates for post-v1 releases. Not in scope for the initial implementation but acknowledged as natural extensions:
+
+- **`bocd.plot` module** — optional matplotlib dependency providing `plot_changepoint_probs(results)` and `plot_run_length_posterior(results)` for notebook workflows.
+- **Serialization** — `Detector.to_dict()` / `Detector.from_dict()` for saving and restoring detector state across process restarts.
+- **Second built-in hazard** — a `LogisticHazard` or `WeibullHazard` demonstrating run-length-dependent hazard design and broadening the built-in offering.
+- **Multivariate extension** — observation models accepting vector inputs.
+- **Welford's algorithm** — numerically stable online variance for GaussianModel, eliminating the `sum_x2` overflow limitation.
 
 ## References
 
