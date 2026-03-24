@@ -1,0 +1,406 @@
+"""Tests for the Detector class."""
+
+from __future__ import annotations
+
+import numpy as np
+import pytest
+from numpy.typing import NDArray
+
+from bocd._typing import HazardFunction, ObservationModel
+from bocd.detector import Detector
+from bocd.hazards.constant import ConstantHazard
+from bocd.models.gaussian import GaussianModel
+from bocd.models.poisson import PoissonModel
+from bocd.result import Result
+
+
+# ---------------------------------------------------------------------------
+# Construction & defaults
+# ---------------------------------------------------------------------------
+
+
+class TestDetectorInit:
+    """Tests for Detector construction and defaults."""
+
+    def test_zero_args_creates_detector(self) -> None:
+        d = Detector()
+        assert d.step_count == 0
+
+    def test_custom_model_and_hazard(self) -> None:
+        d = Detector(model=GaussianModel(mu_0=5.0), hazard=ConstantHazard(0.1))
+        assert d.step_count == 0
+
+    def test_max_run_length_param(self) -> None:
+        d = Detector(max_run_length=100)
+        assert d.step_count == 0
+
+    def test_invalid_model_raises_type_error(self) -> None:
+        with pytest.raises(TypeError):
+            Detector(model="not a model")  # type: ignore[arg-type]
+
+    def test_invalid_hazard_raises_type_error(self) -> None:
+        with pytest.raises(TypeError):
+            Detector(hazard="not a hazard")  # type: ignore[arg-type]
+
+
+# ---------------------------------------------------------------------------
+# Streaming update
+# ---------------------------------------------------------------------------
+
+
+class TestDetectorUpdate:
+    """Tests for streaming update."""
+
+    def test_returns_result(self) -> None:
+        d = Detector()
+        r = d.update(1.0)
+        assert isinstance(r, Result)
+
+    def test_step_counter_increments(self) -> None:
+        d = Detector()
+        d.update(1.0)
+        assert d.step_count == 1
+        d.update(2.0)
+        assert d.step_count == 2
+
+    def test_result_step_is_zero_indexed(self) -> None:
+        d = Detector()
+        r0 = d.update(1.0)
+        r1 = d.update(2.0)
+        assert r0.step == 0
+        assert r1.step == 1
+
+    def test_cp_prob_in_unit_interval(self) -> None:
+        d = Detector()
+        for x in [1.0, 2.0, 3.0]:
+            r = d.update(x)
+            assert 0.0 <= r.changepoint_prob <= 1.0
+
+    def test_posterior_sums_to_one(self) -> None:
+        d = Detector()
+        for x in [1.0, 2.0, 3.0]:
+            r = d.update(x)
+            assert sum(r.run_length_posterior) == pytest.approx(1.0, abs=1e-10)
+
+    def test_posterior_shape_grows(self) -> None:
+        d = Detector()
+        r0 = d.update(1.0)
+        assert r0.run_length_posterior.shape == (2,)
+        r1 = d.update(2.0)
+        assert r1.run_length_posterior.shape == (3,)
+
+    def test_non_finite_nan_raises(self) -> None:
+        d = Detector()
+        with pytest.raises(ValueError):
+            d.update(float("nan"))
+
+    def test_non_finite_inf_raises(self) -> None:
+        d = Detector()
+        with pytest.raises(ValueError):
+            d.update(float("inf"))
+
+    def test_non_finite_neg_inf_raises(self) -> None:
+        d = Detector()
+        with pytest.raises(ValueError):
+            d.update(float("-inf"))
+
+    def test_state_unchanged_after_validation_failure(self) -> None:
+        d = Detector()
+        d.update(1.0)
+        assert d.step_count == 1
+        with pytest.raises(ValueError):
+            d.update(float("nan"))
+        assert d.step_count == 1
+
+    def test_poisson_rejects_negative(self) -> None:
+        d = Detector(model=PoissonModel())
+        with pytest.raises(ValueError, match="x >= 0"):
+            d.update(-1.0)
+
+
+# ---------------------------------------------------------------------------
+# Reset
+# ---------------------------------------------------------------------------
+
+
+class TestDetectorReset:
+    """Tests for reset()."""
+
+    def test_reset_clears_step_count(self) -> None:
+        d = Detector()
+        d.update(1.0)
+        d.update(2.0)
+        d.reset()
+        assert d.step_count == 0
+
+    def test_reset_restores_prior_posterior(self) -> None:
+        d = Detector()
+        d.update(1.0)
+        d.reset()
+        posterior = d.run_length_posterior
+        np.testing.assert_array_almost_equal(posterior, [1.0])
+
+
+# ---------------------------------------------------------------------------
+# Batch mode
+# ---------------------------------------------------------------------------
+
+
+class TestDetectorFit:
+    """Tests for batch mode."""
+
+    def test_returns_list_of_results(self) -> None:
+        d = Detector()
+        results = d.fit([1.0, 2.0, 3.0])
+        assert isinstance(results, list)
+        assert len(results) == 3
+        assert all(isinstance(r, Result) for r in results)
+
+    def test_fit_resets_before_processing(self) -> None:
+        d = Detector()
+        d.update(100.0)
+        d.update(200.0)
+        results = d.fit([1.0, 2.0])
+        assert results[0].step == 0
+        assert d.step_count == 2
+
+    def test_empty_input_returns_empty(self) -> None:
+        d = Detector()
+        results = d.fit([])
+        assert results == []
+
+    def test_non_array_raises_type_error(self) -> None:
+        d = Detector()
+        with pytest.raises(TypeError):
+            d.fit("not an array")  # type: ignore[arg-type]
+
+    def test_2d_array_raises_type_error(self) -> None:
+        d = Detector()
+        with pytest.raises(TypeError):
+            d.fit(np.array([[1, 2], [3, 4]]))
+
+    def test_non_finite_raises_value_error(self) -> None:
+        d = Detector()
+        with pytest.raises(ValueError):
+            d.fit([1.0, float("nan"), 3.0])
+
+    def test_state_unchanged_on_validation_failure(self) -> None:
+        d = Detector()
+        d.update(1.0)
+        with pytest.raises(ValueError):
+            d.fit([1.0, float("nan")])
+        assert d.step_count == 1  # still from the previous update
+
+    def test_detector_continues_after_fit(self) -> None:
+        d = Detector()
+        d.fit([1.0, 2.0, 3.0])
+        r = d.update(4.0)
+        assert r.step == 3  # continues from fit
+
+
+# ---------------------------------------------------------------------------
+# Streaming / batch equivalence
+# ---------------------------------------------------------------------------
+
+
+class TestStreamingBatchEquivalence:
+    """Streaming and batch must produce identical results."""
+
+    def test_equivalence(self) -> None:
+        obs = [1.0, 2.0, 3.0, 4.0, 5.0]
+
+        d_stream = Detector()
+        streaming = [d_stream.update(x) for x in obs]
+
+        d_batch = Detector()
+        batch = d_batch.fit(obs)
+
+        for s, b in zip(streaming, batch):
+            assert s.changepoint_prob == pytest.approx(b.changepoint_prob)
+            np.testing.assert_array_almost_equal(
+                s.run_length_posterior, b.run_length_posterior
+            )
+            assert s.most_likely_run_length == b.most_likely_run_length
+            assert s.step == b.step
+
+
+# ---------------------------------------------------------------------------
+# Truncation
+# ---------------------------------------------------------------------------
+
+
+class TestMaxRunLength:
+    """Tests for truncation."""
+
+    def test_posterior_capped_at_max(self) -> None:
+        d = Detector(max_run_length=5)
+        for i in range(20):
+            r = d.update(float(i))
+        assert len(r.run_length_posterior) <= 5
+
+    def test_posterior_still_sums_to_one(self) -> None:
+        d = Detector(max_run_length=10)
+        for i in range(50):
+            r = d.update(float(i))
+            assert sum(r.run_length_posterior) == pytest.approx(1.0, abs=1e-10)
+
+    def test_truncation_does_not_break_detection(self) -> None:
+        """With truncation, detector should still respond to mean shift."""
+        rng = np.random.default_rng(42)
+        series = np.concatenate([rng.normal(0, 1, 100), rng.normal(10, 1, 100)])
+        d = Detector(max_run_length=50)
+        results = d.fit(series)
+        cp_probs = [r.changepoint_prob for r in results]
+        # Should see elevated cp_prob near t=100
+        max_cp_idx = int(np.argmax(cp_probs[80:120])) + 80
+        assert 95 <= max_cp_idx <= 110
+
+
+# ---------------------------------------------------------------------------
+# Copy
+# ---------------------------------------------------------------------------
+
+
+class TestDetectorCopy:
+    """Tests for Detector.copy()."""
+
+    def test_copy_is_independent(self) -> None:
+        d = Detector()
+        d.update(1.0)
+        d.update(2.0)
+        c = d.copy()
+
+        # Advance original
+        d.update(100.0)
+        assert d.step_count == 3
+
+        # Copy is unaffected
+        assert c.step_count == 2
+        r = c.update(3.0)
+        assert r.step == 2
+
+    def test_copy_produces_same_results(self) -> None:
+        d = Detector()
+        d.update(1.0)
+        c = d.copy()
+
+        r_orig = d.update(2.0)
+        r_copy = c.update(2.0)
+        assert r_orig.changepoint_prob == pytest.approx(r_copy.changepoint_prob)
+
+
+# ---------------------------------------------------------------------------
+# run_length_posterior property
+# ---------------------------------------------------------------------------
+
+
+class TestRunLengthPosteriorProperty:
+    """Tests for the run_length_posterior property."""
+
+    def test_returns_copy(self) -> None:
+        d = Detector()
+        d.update(1.0)
+        p1 = d.run_length_posterior
+        p2 = d.run_length_posterior
+        assert p1 is not p2
+        np.testing.assert_array_equal(p1, p2)
+
+    def test_initial_posterior_is_prior(self) -> None:
+        d = Detector()
+        np.testing.assert_array_almost_equal(d.run_length_posterior, [1.0])
+
+
+# ---------------------------------------------------------------------------
+# Integration: known changepoint detection
+# ---------------------------------------------------------------------------
+
+
+class TestIntegrationGaussianStep:
+    """Detect a known mean shift with default Gaussian model."""
+
+    def test_detects_mean_shift(self, gaussian_step_series: np.ndarray) -> None:
+        d = Detector()
+        results = d.fit(gaussian_step_series)
+        cp_probs = [r.changepoint_prob for r in results]
+        # Peak cp_prob should be near t=200
+        search_start, search_end = 190, 220
+        peak_idx = int(np.argmax(cp_probs[search_start:search_end])) + search_start
+        assert 195 <= peak_idx <= 215
+
+    def test_stationary_stays_quiet(self, no_changepoint_series: np.ndarray) -> None:
+        d = Detector()
+        results = d.fit(no_changepoint_series)
+        cp_probs = [r.changepoint_prob for r in results]
+        # After initial transient (first ~20 steps), no cp_prob should exceed 0.5
+        assert max(cp_probs[20:]) < 0.5
+
+
+class TestIntegrationPoissonRate:
+    """Detect rate changes with Poisson model."""
+
+    def test_detects_rate_change(self, poisson_rate_change: np.ndarray) -> None:
+        d = Detector(model=PoissonModel(), hazard=ConstantHazard(rate=1 / 100))
+        results = d.fit(poisson_rate_change)
+        cp_probs = [r.changepoint_prob for r in results]
+        # Should see elevated cp_prob near t=150 and t=300
+        peak1 = int(np.argmax(cp_probs[140:170])) + 140
+        peak2 = int(np.argmax(cp_probs[290:320])) + 290
+        assert 145 <= peak1 <= 165
+        assert 295 <= peak2 <= 315
+
+
+class TestIntegrationMultiChangepoint:
+    """Multiple regime changes."""
+
+    def test_detects_multiple_changes(
+        self, multi_changepoint_series: np.ndarray
+    ) -> None:
+        d = Detector(hazard=ConstantHazard(rate=1 / 50))
+        results = d.fit(multi_changepoint_series)
+        cp_probs = [r.changepoint_prob for r in results]
+        # Count how many times cp_prob exceeds 0.5 (non-consecutive)
+        high_cp = np.array(cp_probs) > 0.5
+        # Find transitions from low to high
+        changes = np.diff(high_cp.astype(int))
+        detected = int(np.sum(changes == 1))
+        # Should detect at least 3 of the 5 true changepoints
+        assert detected >= 3
+
+
+class TestIntegrationCustomModel:
+    """A minimal Protocol-satisfying model works with Detector."""
+
+    def test_custom_model_runs(self) -> None:
+        class ConstantModel:
+            """Always predicts uniform — trivial but valid."""
+
+            def __init__(self) -> None:
+                self.reset()
+
+            def log_predictive_prob(self, x: float) -> NDArray[np.float64]:
+                return self._log_probs
+
+            def update(self, x: float) -> None:
+                self._log_probs = np.concatenate(
+                    [[np.log(0.5)], self._log_probs]
+                )
+
+            def reset(self) -> None:
+                self._log_probs = np.array([np.log(0.5)])
+
+            def copy(self) -> "ConstantModel":
+                m = ConstantModel()
+                m._log_probs = self._log_probs.copy()
+                return m
+
+            def truncate(self, max_len: int) -> None:
+                self._log_probs = self._log_probs[:max_len]
+
+            def validate_observation(self, x: float) -> None:
+                pass
+
+        d = Detector(model=ConstantModel())
+        results = d.fit([1.0, 2.0, 3.0, 4.0, 5.0])
+        assert len(results) == 5
+        for r in results:
+            assert 0 <= r.changepoint_prob <= 1

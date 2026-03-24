@@ -28,3 +28,4 @@ Thumbs.db
 # Process artifacts (plans, brainstorming, agent state)
 .superpowers/
 .claude/
+docs/superpowers
