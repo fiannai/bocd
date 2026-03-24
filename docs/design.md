@@ -268,6 +268,11 @@ class ObservationModel(Protocol):
         enforce model-specific constraints. Called by Detector
         after finiteness check, before _core.step().
         Raises ValueError if x is invalid for this model.
+
+        Note: the library validates inputs but not model outputs.
+        Custom models must return finite values from
+        log_predictive_prob(); NaN/Inf outputs will silently
+        corrupt the posterior. Use property-based tests to verify.
         """
         ...
 
@@ -384,14 +389,21 @@ class Detector:
         Returns list[Result], one per observation. Returns [] for
         empty input. Raises TypeError if observations is not a 1-D
         numeric array. Raises ValueError if any value is non-finite.
-        On validation failure, detector state is unchanged."""
+        On validation failure, detector state is unchanged.
+        After completion, detector state reflects the processed
+        series and may be continued with update()."""
         ...
 
     # Snapshot
     def copy(self) -> "Detector":
         """Independent clone: copied joint, copied model, same hazard
         reference, same max_run_length, same step_count. The clone
-        and original can evolve independently."""
+        and original can evolve independently.
+
+        Detector is not thread-safe — do not share an instance
+        across threads. Separate instances (including copies) may
+        be used concurrently in different threads or processes
+        without synchronization."""
         ...
 
     # Inspection
@@ -598,6 +610,9 @@ Candidates for post-v1 releases. Not in scope for the initial implementation but
 - **Second built-in hazard** — a `LogisticHazard` or `WeibullHazard` demonstrating run-length-dependent hazard design and broadening the built-in offering.
 - **Multivariate extension** — observation models accepting vector inputs.
 - **Welford's algorithm** — numerically stable online variance for GaussianModel, eliminating the `sum_x2` overflow limitation.
+
+**Known limitations:**
+- BOCD is optimized for abrupt regime changes. Gradual drift produces delayed or weak changepoint signals — this is inherent to the algorithm, not a bug.
 
 ## References
 
