@@ -2,32 +2,48 @@
 
 Bayesian Online Change Point Detection for Python.
 
-[![PyPI](https://img.shields.io/pypi/v/bocd)](https://pypi.org/project/bocd/)
 [![CI](https://github.com/fiannai/bocd/actions/workflows/ci.yml/badge.svg)](https://github.com/fiannai/bocd/actions)
-[![codecov](https://img.shields.io/codecov/c/github/fiannai/bocd)](https://codecov.io/gh/fiannai/bocd)
 [![Python](https://img.shields.io/pypi/pyversions/bocd)](https://pypi.org/project/bocd/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 
 A pip-installable implementation of the Adams & MacKay (2007) algorithm for detecting regime changes in streaming or batch time series data. Easy defaults, full extensibility, production-grade quality.
 
-## Quickstart
+## Install
+
+From PyPI (when published):
 
 ```bash
 pip install bocd
 ```
 
+From source:
+
+```bash
+git clone https://github.com/fiannai/bocd.git
+cd bocd
+pip install -e ".[dev]"
+```
+
+Requires Python 3.11+.
+
+## Quickstart
+
 ```python
 from bocd import Detector
 
 results = Detector().fit(your_time_series)
-changepoints = [r.step for r in results if r.changepoint_prob > 0.5]
+
+# Detection via run-length reset (most reliable with constant hazard)
+for i in range(1, len(results)):
+    if results[i - 1].most_likely_run_length - results[i].most_likely_run_length > 20:
+        print(f"Changepoint detected at step {results[i].step}")
 ```
 
 ## Features
 
 - **Streaming and batch** — `update()` for production streams, `fit()` for notebooks
 - **Three built-in models** — Gaussian, Student-t (outlier-robust), Poisson (count data)
-- **Protocol-based extensibility** — implement 4 methods to add any observation model
+- **Protocol-based extensibility** — implement the `ObservationModel` protocol to add any model
 - **Vectorized** — numpy broadcasts over run lengths, no Python loops
 - **Numerically stable** — log-space arithmetic throughout, optional run-length truncation
 - **Typed** — full type annotations, py.typed marker, mypy strict
@@ -45,11 +61,33 @@ detector = Detector(
     max_run_length=500,
 )
 
+prev_rl = 0
 for observation in stream:
     result = detector.update(observation)
-    if result.changepoint_prob > 0.6:
+    if prev_rl - result.most_likely_run_length > 20:
         handle_changepoint(result)
+    prev_rl = result.most_likely_run_length
 ```
+
+## Custom Models
+
+Any class implementing the `ObservationModel` protocol works — no inheritance required:
+
+```python
+from bocd import Detector
+
+class MyModel:
+    def log_predictive_prob(self, x): ...
+    def update(self, x): ...
+    def reset(self): ...
+    def copy(self): ...
+    def truncate(self, max_len): ...
+    def validate_observation(self, x): ...
+
+detector = Detector(model=MyModel())
+```
+
+See the [design doc](docs/design.md) for the full protocol specification and a worked `ExponentialModel` example.
 
 ## Why bocd?
 
@@ -61,14 +99,9 @@ for observation in stream:
 | Typed (PEP 561) | Yes | No | No |
 | Custom models via Protocol | Yes | N/A | No |
 
-## Documentation
+## Contributing
 
-Full docs at [bocd.readthedocs.io](https://bocd.readthedocs.io), including:
-
-- [Quickstart guide](https://bocd.readthedocs.io/en/latest/guide/quickstart.html)
-- [API reference](https://bocd.readthedocs.io/en/latest/api.html)
-- [Custom models guide](https://bocd.readthedocs.io/en/latest/guide/custom-models.html)
-- [Tutorial notebook](https://bocd.readthedocs.io/en/latest/notebooks/tutorial.html) [![Open in Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/fiannai/bocd/blob/main/docs/notebooks/tutorial.ipynb)
+See [CONTRIBUTING.md](CONTRIBUTING.md). Issues and feedback are welcome.
 
 ## Citation
 
