@@ -199,6 +199,21 @@ class TestDetectorFit:
         r = d.update(4.0)
         assert r.step == 3  # continues from fit
 
+    def test_state_unchanged_on_model_domain_error(self) -> None:
+        """Regression: fit([3.0, -1.0]) with Poisson left detector at step 1."""
+        d = Detector(model=PoissonModel())
+        d.update(5.0)
+        assert d.step_count == 1
+        with pytest.raises(ValueError, match="x >= 0"):
+            d.fit([3.0, -1.0])
+        assert d.step_count == 1  # unchanged — not 0, not 2
+
+    def test_fit_rejects_fractional_poisson(self) -> None:
+        """Regression: Poisson with x=1.5 collapsed posterior to nan."""
+        d = Detector(model=PoissonModel())
+        with pytest.raises(ValueError, match="integer-valued"):
+            d.fit([1.0, 2.0, 1.5])
+
 
 # ---------------------------------------------------------------------------
 # Streaming / batch equivalence

@@ -87,6 +87,15 @@ class TestStep:
         _, cp_hi = step(1.0, joint, model_hi, hazard_hi)
         assert cp_hi > cp_lo
 
+    def test_extreme_observation_produces_finite_output(self) -> None:
+        """Regression: x=1e155 caused nan via sum_x2 overflow (no epsilon floor)."""
+        model = GaussianModel()
+        hazard = ConstantHazard()
+        joint = np.array([0.0])
+        new_joint, cp_prob = step(1e155, joint, model, hazard)
+        assert np.all(np.isfinite(new_joint))
+        assert 0.0 <= cp_prob <= 1.0
+
 
 class TestRun:
     """Tests for _core.run()."""

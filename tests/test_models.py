@@ -295,3 +295,12 @@ class TestPoissonModel:
     def test_validate_observation_accepts_positive(self) -> None:
         m = PoissonModel()
         m.validate_observation(5.0)  # should not raise
+
+    def test_validate_observation_rejects_fractional(self) -> None:
+        m = PoissonModel()
+        with pytest.raises(ValueError, match="integer-valued"):
+            m.validate_observation(1.5)
+
+    def test_validate_observation_accepts_integer_float(self) -> None:
+        m = PoissonModel()
+        m.validate_observation(3.0)  # integer-valued float is fine

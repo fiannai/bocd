@@ -12,6 +12,10 @@ if TYPE_CHECKING:
 
     from bocd._typing import HazardFunction, ObservationModel
 
+# Minimum log-probability floor to prevent log(0) producing -inf that
+# propagates to nan during normalization.  Equivalent to ~5e-324.
+_LOG_EPS = np.float64(-745.0)
+
 
 def step(
     x: float,
@@ -27,7 +31,7 @@ def step(
     t = len(joint)
 
     # 1. Predictive log-probabilities under each run-length hypothesis
-    log_pred = model.log_predictive_prob(x)  # shape (t,)
+    log_pred = np.maximum(model.log_predictive_prob(x), _LOG_EPS)  # shape (t,)
 
     # 2. Hazard values
     run_lengths = np.arange(t, dtype=np.int64)
@@ -44,7 +48,8 @@ def step(
     new_joint[0] = log_cp
     new_joint[1:] = log_growth
 
-    # 6. Normalize
+    # 6. Normalize (floor prevents all-(-inf) → nan)
+    new_joint = np.maximum(new_joint, _LOG_EPS)
     log_evidence = logsumexp(new_joint)
     new_joint -= log_evidence
 

@@ -90,7 +90,11 @@ class Detector:
     # --- Batch ---
 
     def fit(self, observations: ArrayLike) -> list[Result]:
-        """Batch mode. Resets state, then processes all observations."""
+        """Batch mode. Resets state, then processes all observations.
+
+        All validation runs before any state mutation. On failure,
+        detector state is unchanged.
+        """
         try:
             arr = np.asarray(observations, dtype=np.float64)
         except (ValueError, TypeError) as e:
@@ -107,6 +111,12 @@ class Detector:
 
         if not np.all(np.isfinite(arr)):
             raise ValueError("All observations must be finite (no NaN or Inf)")
+
+        # Pre-validate all observations against model domain before
+        # resetting state, so a mid-batch domain error leaves the
+        # detector unchanged.
+        for x in arr:
+            self._model.validate_observation(float(x))
 
         self.reset()
         results: list[Result] = []

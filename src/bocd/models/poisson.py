@@ -60,6 +60,10 @@ class PoissonModel:
         self._count = self._count[:max_len]
 
     def validate_observation(self, x: float) -> None:
-        """Reject negative observations."""
+        """Reject negative or non-integer observations."""
         if x < 0:
             raise ValueError(f"PoissonModel requires x >= 0, got {x}")
+        if x != int(x):
+            raise ValueError(
+                f"PoissonModel requires integer-valued observations, got {x}"
+            )
