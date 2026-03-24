@@ -24,3 +24,7 @@ Thumbs.db
 .idea/
 .vscode/
 *.swp
+
+# Process artifacts (plans, brainstorming, agent state)
+.superpowers/
+.claude/
