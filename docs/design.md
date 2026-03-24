@@ -111,6 +111,19 @@ Adams & MacKay (2007) maintains a probability distribution over run lengths — 
 
 Changepoint probability = `joint[0]` — the posterior mass on run length zero.
 
+**Initial state:** `joint = np.array([0.0])` in log-space — all prior mass on run-length 0 (i.e., P(r=0) = 1.0). Detector creates this internally; core API callers must provide it as the starting joint for their first `step()` call.
+
+**Shape evolution:** The joint distribution grows by one element per observation. After processing `n` observations, the posterior has `n + 1` entries (run lengths 0 through n):
+
+| Observations processed | `Result.step` (0-indexed) | Posterior shape |
+|:---:|:---:|:---:|
+| 0 (prior) | — | `(1,)` |
+| 1 | 0 | `(2,)` |
+| 2 | 1 | `(3,)` |
+| t | t−1 | `(t+1,)` |
+
+The general formula: shape = `(step + 2,)` when unbounded, `min(step + 2, max_run_length)` when truncated.
+
 ### Vectorization Strategy
 
 Sufficient statistics are numpy arrays indexed by run length, not object-per-hypothesis copies. For each built-in model:
@@ -137,8 +150,24 @@ In the vectorized implementation, these are computed from sufficient statistics 
 ### Numerical Stability
 
 - **Log-space arithmetic** throughout — all probability computations use log-probabilities to avoid underflow on long series. `scipy.special.logsumexp` for normalization.
-- **Run-length truncation** — optional `max_run_length` parameter on `Detector` caps the distribution after each `step()` call. Hypotheses beyond the limit are discarded and the distribution is renormalized. The core `step()` function is unaware of truncation — this is the Detector layer's responsibility. Essential for infinite streams. When active, `Result.run_length_posterior` has shape `(min(step+1, max_run_length),)` rather than `(step+1,)`.
+- **Run-length truncation** — optional `max_run_length` parameter on `Detector` caps both the joint distribution and model sufficient statistics after each step. Hypotheses beyond the limit are discarded: Detector truncates the joint array, calls `model.truncate(max_run_length)` to slice sufficient-statistics arrays to match, then renormalizes. The core `step()` function is unaware of truncation — this is the Detector layer's responsibility. Essential for infinite streams. When truncation is active, per-step time and memory are O(max_run_length) rather than O(t).
 - **Minimum probability floor** — small epsilon prevents log(0) in edge cases.
+- **Sufficient statistics overflow** — sufficient statistics (`sum_x`, `sum_x2`, `count`) are accumulated in linear space. For GaussianModel, `sum_x2` can overflow float64 for observations with magnitude exceeding ~1e154. This is a known limitation; Welford's online algorithm for numerically stable variance is a potential future enhancement.
+
+### Input Validation
+
+Two-tier validation policy matching the library's layered architecture:
+
+**Detector layer (managed API):**
+- `Detector.update(x)` raises `ValueError` if `x` is non-finite (NaN, Inf, -Inf), before any state mutation.
+- `Detector.fit(observations)` raises `TypeError` if observations cannot be converted to a 1-D numeric array, before reset. Raises `ValueError` if any observation is non-finite, before reset. On validation failure, detector state is unchanged.
+- `Detector.fit([])` returns an empty list and leaves the detector in its reset state.
+- `Detector.__init__` raises `TypeError` if model does not satisfy `ObservationModel` or hazard does not satisfy `HazardFunction` (via `isinstance` with `runtime_checkable` Protocols). Note: `runtime_checkable` verifies method existence only, not signatures or return types.
+
+**Core layer (unmanaged API):**
+- `_core.step()` and `_core.run()` do not validate inputs. Callers are responsible for ensuring finite values and correct types. Non-finite inputs will propagate through sufficient statistics and silently corrupt model state. This keeps the core layer fast for callers who have already validated upstream.
+
+**Model-specific domain constraints** are not enforced at the Detector level — for example, PoissonModel expects non-negative observations but `Detector.update(-1.0)` will not raise (it passes the finiteness check). Model-specific input validation is a candidate for a future version. Until then, domain constraints are the caller's responsibility and are documented per model.
 
 ### Core Function Signatures
 
@@ -212,7 +241,20 @@ class ObservationModel(Protocol):
         ...
 
     def copy(self) -> "ObservationModel":
-        """Deep copy with independent numpy arrays."""
+        """Deep copy with independent numpy arrays.
+
+        Custom models may return their concrete type
+        (e.g., -> 'MyModel'). This satisfies the Protocol
+        through covariant return typing.
+        """
+        ...
+
+    def truncate(self, max_len: int) -> None:
+        """Truncate sufficient statistics arrays to max_len entries.
+
+        Called by Detector after each step when max_run_length is
+        active. Slice all run-length-indexed arrays to [:max_len].
+        """
         ...
 
 
@@ -234,15 +276,15 @@ class HazardFunction(Protocol):
 
 ### GaussianModel
 
-Normal-Inverse-Gamma conjugate prior. Hyperparameters: `mu_0`, `kappa`, `alpha`, `beta`. Predictive distribution is Student-t. Use for continuous data with roughly normal variation within a regime (temperatures, latencies, stock returns).
+Normal-Inverse-Gamma conjugate prior. Default hyperparameters: `mu_0=0.0` (prior mean), `kappa=1.0` (prior precision weight), `alpha=1.0` (shape — gives df=2 for predictive Student-t), `beta=1.0` (scale). Predictive distribution is Student-t. Use for continuous data with roughly normal variation within a regime (temperatures, latencies, stock returns).
 
 ### StudentTModel
 
-A robust-prior preset of `GaussianModel`, not a distinct model family. Implemented as a thin subclass (or factory) that delegates all conjugate math to `GaussianModel` with `alpha=0.5` (giving df=1, Cauchy-like tails) vs. Gaussian's default `alpha=1.0` (df=2). The lower degrees of freedom produce heavier tails, making the predictive distribution less sensitive to outliers and reducing false changepoint detections from extreme observations. No duplicate conjugate math — `StudentTModel` inherits or delegates everything from `GaussianModel`. Kept as a separate importable name (`from bocd.models import StudentTModel`) for discoverability. Use for data with occasional spikes (network traffic, sensor data).
+A robust-prior preset of `GaussianModel`, not a distinct model family. Implemented as a subclass of `GaussianModel` that overrides `alpha` to 0.5. Accepts the same constructor parameters as `GaussianModel` (`mu_0`, `kappa`, `alpha`, `beta`) but defaults `alpha=0.5` (giving df=1, Cauchy-like tails) vs. Gaussian's default `alpha=1.0` (df=2). The lower degrees of freedom produce heavier tails, making the predictive distribution less sensitive to outliers and reducing false changepoint detections from extreme observations. No duplicate conjugate math — `StudentTModel` inherits or delegates everything from `GaussianModel`. Kept as a separate importable name (`from bocd.models import StudentTModel`) for discoverability. Use for data with occasional spikes (network traffic, sensor data).
 
 ### PoissonModel
 
-Gamma-Poisson conjugate prior. Hyperparameters: `alpha`, `beta`. Predictive distribution is Negative Binomial. Use for count/rate data — events per time window, requests per second, error counts. This is what GLADyS feeds it.
+Gamma-Poisson conjugate prior. Hyperparameters: `alpha`, `beta`. Predictive distribution is Negative Binomial. Accepts non-negative observations (counts). Negative values are mathematically invalid for the Gamma-Poisson conjugate and produce undefined results — input domain validation is the caller's responsibility (see Input Validation). Use for count/rate data — events per time window, requests per second, error counts.
 
 ## Built-in Hazard Functions
 
@@ -274,7 +316,7 @@ detector = Detector(model=m, hazard=lambda rl: 1 - np.exp(-rl / 100))
 @dataclass(frozen=True, slots=True)
 class Result:
     changepoint_prob: float        # P(run_length = 0)
-    run_length_posterior: NDArray   # Full distribution — shape (step+1,) when unbounded, (min(step+1, max_run_length),) when truncated
+    run_length_posterior: NDArray   # Full distribution — shape (step+2,) when unbounded, min(step+2, max_run_length) when truncated
     most_likely_run_length: int    # argmax of posterior
     step: int                      # 0-indexed observation number
 ```
@@ -297,15 +339,39 @@ class Detector:
         Defaults to GaussianModel() + ConstantHazard() when called
         with no arguments. Fresh instances are created per Detector
         to avoid shared mutable state across detectors.
+
+        When model or hazard is provided, Detector stores the
+        reference directly and assumes exclusive ownership. Sharing
+        a model or stateful hazard instance across multiple Detectors
+        is unsupported — mutations from one detector will corrupt
+        the other. Use model.copy() to create independent instances.
+
+        Raises TypeError if model does not satisfy ObservationModel
+        or hazard does not satisfy HazardFunction (via isinstance
+        with runtime_checkable Protocols). Note: runtime_checkable
+        verifies method existence only, not signatures or return types.
         """
         ...
 
     # Streaming
-    def update(self, x: float) -> Result: ...
-    def reset(self) -> None: ...
+    def update(self, x: float) -> Result:
+        """Process one observation. Raises ValueError if x is non-finite."""
+        ...
+    def reset(self) -> None:
+        """Restore to initial state: reinitializes joint to prior
+        np.array([0.0]), calls model.reset(), sets step_count to 0.
+        After reset, detector is equivalent to a freshly constructed
+        instance with the same model, hazard, and max_run_length."""
+        ...
 
     # Batch
-    def fit(self, observations: ArrayLike) -> list[Result]: ...
+    def fit(self, observations: ArrayLike) -> list[Result]:
+        """Batch mode. Resets state, then processes all observations.
+        Returns list[Result], one per observation. Returns [] for
+        empty input. Raises TypeError if observations is not a 1-D
+        numeric array. Raises ValueError if any value is non-finite.
+        On validation failure, detector state is unchanged."""
+        ...
 
     # Inspection
     @property
@@ -316,7 +382,7 @@ class Detector:
 
 ### Design Decisions
 
-- **`Detector()` works with zero arguments** — defaults to `GaussianModel()` + `ConstantHazard(1/200)`, instantiated fresh inside `__init__` to avoid Python's mutable-default-argument pitfall. Two lines from import to changepoint detection.
+- **`Detector()` works with zero arguments** — defaults to `GaussianModel()` + `ConstantHazard(1/200)`, instantiated fresh inside `__init__` to avoid Python's mutable-default-argument pitfall. Caller-provided models and hazards are stored by reference (exclusive ownership assumed). Two lines from import to changepoint detection.
 - **`fit()` resets state** — prevents leftover-state bugs in batch mode. Use `update()` in a loop to continue from existing state.
 - **`fit()` returns `list[Result]`** — standard Python type, works with all existing tooling.
 - **`fit()` calls `step()` in a loop** — resets state, then calls `_core.step()` for each observation, applying truncation per step and wrapping each step's output in a `Result`. The core `run()` function exists as a lower-level batch API returning raw arrays for users who want to avoid `Result` overhead — it does not reset or truncate, so callers must provide a fresh model.
@@ -384,7 +450,7 @@ Tests are written before implementation. The algorithm's math is fully specified
 - Posterior always sums to 1.0 (±epsilon) for arbitrary inputs
 - No NaN or Inf in output for any finite input
 - `changepoint_prob` always in [0, 1]
-- `run_length_posterior` shape matches `step + 1` (unbounded) or `min(step + 1, max_run_length)` (truncated)
+- `run_length_posterior` shape matches `step + 2` (unbounded) or `min(step + 2, max_run_length)` (truncated)
 - Empty or single-observation series don't crash
 - Extreme values produce valid output
 - `copy()` is truly independent
@@ -489,6 +555,10 @@ class ExponentialModel:
         m = ExponentialModel(self._a0, self._b0)
         m._sum_x, m._count = self._sum_x.copy(), self._count.copy()
         return m
+
+    def truncate(self, max_len: int) -> None:
+        self._sum_x = self._sum_x[:max_len]
+        self._count = self._count[:max_len]
 
 # Works immediately:
 detector = Detector(model=ExponentialModel(), hazard=ConstantHazard())
