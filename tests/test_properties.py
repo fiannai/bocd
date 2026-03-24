@@ -8,11 +8,9 @@ from hypothesis import given, settings
 from hypothesis import strategies as st
 
 from bocd.detector import Detector
-from bocd.hazards.constant import ConstantHazard
 from bocd.models.gaussian import GaussianModel
 from bocd.models.poisson import PoissonModel
 from bocd.models.studentt import StudentTModel
-
 
 # ---------------------------------------------------------------------------
 # Strategies
@@ -85,9 +83,7 @@ class TestStudentTProperties:
         d = Detector(model=StudentTModel())
         for x in obs:
             r = d.update(x)
-            assert float(np.sum(r.run_length_posterior)) == pytest.approx(
-                1.0, abs=1e-8
-            )
+            assert float(np.sum(r.run_length_posterior)) == pytest.approx(1.0, abs=1e-8)
 
     @given(obs=observation_lists)
     @settings(max_examples=50)
@@ -110,9 +106,7 @@ class TestPoissonProperties:
         d = Detector(model=PoissonModel())
         for x in obs:
             r = d.update(x)
-            assert float(np.sum(r.run_length_posterior)) == pytest.approx(
-                1.0, abs=1e-8
-            )
+            assert float(np.sum(r.run_length_posterior)) == pytest.approx(1.0, abs=1e-8)
 
     @given(obs=count_lists)
     @settings(max_examples=50)
@@ -143,9 +137,7 @@ class TestTruncationProperties:
         d = Detector(model=GaussianModel(), max_run_length=10)
         for x in obs:
             r = d.update(x)
-            assert float(np.sum(r.run_length_posterior)) == pytest.approx(
-                1.0, abs=1e-8
-            )
+            assert float(np.sum(r.run_length_posterior)) == pytest.approx(1.0, abs=1e-8)
 
     @given(obs=observation_lists)
     @settings(max_examples=30)

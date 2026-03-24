@@ -11,7 +11,6 @@ from bocd.models.gaussian import GaussianModel
 from bocd.models.poisson import PoissonModel
 from bocd.models.studentt import StudentTModel
 
-
 # ---------------------------------------------------------------------------
 # GaussianModel
 # ---------------------------------------------------------------------------

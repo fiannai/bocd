@@ -130,7 +130,7 @@ class TestRun:
         hazard = ConstantHazard()
         obs = np.array([1.0, 2.0, 3.0])
         cp_probs, posteriors = run(obs, model, hazard)
-        for cp, post in zip(cp_probs, posteriors):
+        for cp, post in zip(cp_probs, posteriors, strict=False):
             assert cp == pytest.approx(float(np.exp(post[0])), abs=1e-12)
 
     def test_empty_input(self) -> None:

@@ -2,17 +2,19 @@
 
 from __future__ import annotations
 
+from typing import TYPE_CHECKING
+
 import numpy as np
 import pytest
-from numpy.typing import NDArray
 
-from bocd._typing import HazardFunction, ObservationModel
 from bocd.detector import Detector
 from bocd.hazards.constant import ConstantHazard
 from bocd.models.gaussian import GaussianModel
 from bocd.models.poisson import PoissonModel
 from bocd.result import Result
 
+if TYPE_CHECKING:
+    from numpy.typing import NDArray
 
 # ---------------------------------------------------------------------------
 # Construction & defaults
@@ -215,7 +217,7 @@ class TestStreamingBatchEquivalence:
         d_batch = Detector()
         batch = d_batch.fit(obs)
 
-        for s, b in zip(streaming, batch):
+        for s, b in zip(streaming, batch, strict=False):
             assert s.changepoint_prob == pytest.approx(b.changepoint_prob)
             np.testing.assert_array_almost_equal(
                 s.run_length_posterior, b.run_length_posterior
@@ -321,18 +323,22 @@ class TestIntegrationGaussianStep:
     def test_detects_mean_shift(self, gaussian_step_series: np.ndarray) -> None:
         d = Detector()
         results = d.fit(gaussian_step_series)
-        cp_probs = [r.changepoint_prob for r in results]
-        # Peak cp_prob should be near t=200
-        search_start, search_end = 190, 220
-        peak_idx = int(np.argmax(cp_probs[search_start:search_end])) + search_start
-        assert 195 <= peak_idx <= 215
+        # Detection signal: most_likely_run_length drops near the changepoint.
+        # With constant hazard, cp_prob stays near the hazard rate — the run
+        # length posterior is the correct detection metric for BOCD.
+        rls = [r.most_likely_run_length for r in results]
+        # Before changepoint at t=200, run length should be growing
+        assert rls[195] > 100
+        # After changepoint, run length resets to small values
+        assert rls[202] < 10
 
     def test_stationary_stays_quiet(self, no_changepoint_series: np.ndarray) -> None:
         d = Detector()
         results = d.fit(no_changepoint_series)
-        cp_probs = [r.changepoint_prob for r in results]
-        # After initial transient (first ~20 steps), no cp_prob should exceed 0.5
-        assert max(cp_probs[20:]) < 0.5
+        rls = [r.most_likely_run_length for r in results]
+        # After initial transient, run length should grow monotonically
+        # (no resets = no detected changepoints)
+        assert rls[-1] > 400
 
 
 class TestIntegrationPoissonRate:
@@ -341,12 +347,12 @@ class TestIntegrationPoissonRate:
     def test_detects_rate_change(self, poisson_rate_change: np.ndarray) -> None:
         d = Detector(model=PoissonModel(), hazard=ConstantHazard(rate=1 / 100))
         results = d.fit(poisson_rate_change)
-        cp_probs = [r.changepoint_prob for r in results]
-        # Should see elevated cp_prob near t=150 and t=300
-        peak1 = int(np.argmax(cp_probs[140:170])) + 140
-        peak2 = int(np.argmax(cp_probs[290:320])) + 290
-        assert 145 <= peak1 <= 165
-        assert 295 <= peak2 <= 315
+        rls = [r.most_likely_run_length for r in results]
+        # Run length should reset near t=150 and t=300
+        assert rls[145] > 50  # before first change
+        assert rls[155] < 15  # after first change
+        assert rls[295] > 50  # before second change
+        assert rls[305] < 15  # after second change
 
 
 class TestIntegrationMultiChangepoint:
@@ -357,14 +363,11 @@ class TestIntegrationMultiChangepoint:
     ) -> None:
         d = Detector(hazard=ConstantHazard(rate=1 / 50))
         results = d.fit(multi_changepoint_series)
-        cp_probs = [r.changepoint_prob for r in results]
-        # Count how many times cp_prob exceeds 0.5 (non-consecutive)
-        high_cp = np.array(cp_probs) > 0.5
-        # Find transitions from low to high
-        changes = np.diff(high_cp.astype(int))
-        detected = int(np.sum(changes == 1))
+        rls = [r.most_likely_run_length for r in results]
+        # Count run-length resets (drops of >20 between consecutive steps)
+        drops = sum(1 for i in range(1, len(rls)) if rls[i - 1] - rls[i] > 20)
         # Should detect at least 3 of the 5 true changepoints
-        assert detected >= 3
+        assert drops >= 3
 
 
 class TestIntegrationCustomModel:
@@ -381,14 +384,12 @@ class TestIntegrationCustomModel:
                 return self._log_probs
 
             def update(self, x: float) -> None:
-                self._log_probs = np.concatenate(
-                    [[np.log(0.5)], self._log_probs]
-                )
+                self._log_probs = np.concatenate([[np.log(0.5)], self._log_probs])
 
             def reset(self) -> None:
                 self._log_probs = np.array([np.log(0.5)])
 
-            def copy(self) -> "ConstantModel":
+            def copy(self) -> ConstantModel:
                 m = ConstantModel()
                 m._log_probs = self._log_probs.copy()
                 return m
