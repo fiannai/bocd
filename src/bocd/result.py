@@ -19,7 +19,12 @@ class Result:
     """
 
     changepoint_prob: float
-    """P(run_length = 0) — probability a changepoint just occurred."""
+    """P(run_length = 0).
+
+    With a constant hazard and no truncation this equals the hazard
+    rate on every step, so it does not rise at a regime change. Use
+    :meth:`mass_at_most` or :func:`bocd.detect.detect_changepoints`.
+    """
 
     run_length_posterior: NDArray[np.float64]
     """Full posterior distribution over run lengths (probability space)."""
@@ -29,3 +34,13 @@ class Result:
 
     step: int
     """0-indexed observation number."""
+
+    def mass_at_most(self, run_length: int) -> float:
+        """Posterior probability that the current run length is <= ``run_length``."""
+        if isinstance(run_length, bool) or not isinstance(run_length, int):
+            raise TypeError(
+                f"run_length must be an int, got {type(run_length).__name__}"
+            )
+        if run_length < 0:
+            raise ValueError(f"run_length must be >= 0, got {run_length}")
+        return float(self.run_length_posterior[: run_length + 1].sum())

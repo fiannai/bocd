@@ -35,6 +35,19 @@ class PoissonModel:
         p = beta_n / (beta_n + 1.0)
         return np.asarray(nbinom.logpmf(x, n=alpha_n, p=p), dtype=np.float64)
 
+    def _posterior_params(self) -> tuple[np.ndarray, np.ndarray]:
+        return self._alpha + self._sum_x, self._beta + self._count
+
+    def predictive_mean(self) -> NDArray[np.float64]:
+        """Negative-binomial mean under each run length, alpha_n / beta_n."""
+        alpha_n, beta_n = self._posterior_params()
+        return np.asarray(alpha_n / beta_n, dtype=np.float64)
+
+    def predictive_variance(self) -> NDArray[np.float64]:
+        """Negative-binomial variance under each run length."""
+        alpha_n, beta_n = self._posterior_params()
+        return np.asarray(alpha_n * (beta_n + 1.0) / beta_n**2, dtype=np.float64)
+
     def update(self, x: float) -> None:
         """Add observation to sufficient statistics."""
         self._sum_x = np.concatenate([[0.0], self._sum_x + x])

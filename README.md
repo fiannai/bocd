@@ -29,20 +29,29 @@ Requires Python 3.11+.
 ## Quickstart
 
 ```python
-from bocd import Detector
+from bocd import Detector, detect_changepoints
 
 results = Detector().fit(your_time_series)
 
-# Detection via run-length reset (most reliable with constant hazard)
-for i in range(1, len(results)):
-    if results[i - 1].most_likely_run_length - results[i].most_likely_run_length > 20:
-        print(f"Changepoint detected at step {results[i].step}")
+# A boundary is a MAP run-length collapse that persists for several steps.
+# With a constant hazard, Result.changepoint_prob equals the hazard rate
+# on every step, so thresholding it does not detect anything.
+for cp in detect_changepoints(results):
+    print(f"Changepoint at step {cp.step} (confirmed at {cp.detected_at})")
+```
+
+The default `GaussianModel` is a prior for data near 0 with noise on the order of 1. Match it to the series when that is not true:
+
+```python
+from bocd import Detector, GaussianModel
+
+detector = Detector(model=GaussianModel.from_scale(mean=100.0, scale=1.0))
 ```
 
 ## Features
 
 - **Streaming and batch** — `update()` for production streams, `fit()` for notebooks
-- **Three built-in models** — Gaussian, Student-t (outlier-robust), Poisson (count data)
+- **Three built-in models** — Gaussian, Student-t prior (heavier tails early in a run), Poisson (count data)
 - **Protocol-based extensibility** — implement the `ObservationModel` protocol to add any model
 - **Vectorized** — numpy broadcasts over run lengths, no Python loops
 - **Numerically stable** — log-space arithmetic throughout, optional run-length truncation
@@ -51,7 +60,7 @@ for i in range(1, len(results)):
 ## Streaming Example
 
 ```python
-from bocd import Detector
+from bocd import ChangepointStream, Detector
 from bocd.models import PoissonModel
 from bocd.hazards import ConstantHazard
 
@@ -60,14 +69,16 @@ detector = Detector(
     hazard=ConstantHazard(rate=1/100),
     max_run_length=500,
 )
+alarm = ChangepointStream(drop=20, persistence=5)
 
-prev_rl = 0
 for observation in stream:
     result = detector.update(observation)
-    if prev_rl - result.most_likely_run_length > 20:
-        handle_changepoint(result)
-    prev_rl = result.most_likely_run_length
+    changepoint = alarm.push(result)
+    if changepoint is not None:
+        handle_changepoint(changepoint)
 ```
+
+`max_run_length` caps memory by folding probability for longer runs into the last bin, so a long regime is not discarded. `prune_threshold` (for example `1e-4`) drops a long-run tail only when its mass is already negligible, which shrinks the state after a changepoint.
 
 ## Custom Models
 
