@@ -2,15 +2,18 @@
 
 from __future__ import annotations
 
+import math
 from typing import TYPE_CHECKING
 
 import numpy as np
 import pytest
 
+from bocd.detect import detect_changepoints
 from bocd.detector import Detector
 from bocd.hazards.constant import ConstantHazard
 from bocd.models.gaussian import GaussianModel
 from bocd.models.poisson import PoissonModel
+from bocd.models.studentt import StudentTModel
 from bocd.result import Result
 
 if TYPE_CHECKING:
@@ -262,15 +265,41 @@ class TestMaxRunLength:
             assert sum(r.run_length_posterior) == pytest.approx(1.0, abs=1e-10)
 
     def test_truncation_does_not_break_detection(self) -> None:
-        """With truncation, detector should still respond to mean shift."""
+        """A hard cap still reports a real mean shift, via the run length."""
         rng = np.random.default_rng(42)
         series = np.concatenate([rng.normal(0, 1, 100), rng.normal(10, 1, 100)])
-        d = Detector(max_run_length=50)
-        results = d.fit(series)
-        cp_probs = [r.changepoint_prob for r in results]
-        # Should see elevated cp_prob near t=100
-        max_cp_idx = int(np.argmax(cp_probs[80:120])) + 80
-        assert 95 <= max_cp_idx <= 110
+        results = Detector(max_run_length=50).fit(series)
+        found = detect_changepoints(results)
+        assert len(found) == 1
+        assert 95 <= found[0].step <= 110
+
+    def test_cap_keeps_long_regime(self) -> None:
+        """Folding the tail must not manufacture changepoints on noise."""
+        rng = np.random.default_rng(0)
+        series = rng.normal(0, 1, 400)
+        results = Detector(max_run_length=50).fit(series)
+        assert detect_changepoints(results) == []
+        assert results[-1].most_likely_run_length == 49
+
+    def test_max_run_length_below_two_raises(self) -> None:
+        with pytest.raises(ValueError, match="max_run_length"):
+            Detector(max_run_length=1)
+
+    def test_prune_threshold_out_of_range_raises(self) -> None:
+        with pytest.raises(ValueError, match="prune_threshold"):
+            Detector(prune_threshold=0.0)
+
+    def test_prune_drops_dead_tail_after_changepoint(self) -> None:
+        rng = np.random.default_rng(0)
+        series = np.concatenate([rng.normal(0, 1, 80), rng.normal(8, 1, 80)])
+        results = Detector(prune_threshold=1e-4).fit(series)
+        last = results[-1]
+        # The new regime is 80 points. Pruning drops the dead first regime,
+        # so the posterior is about that long rather than the full series.
+        assert 70 <= last.most_likely_run_length <= 85
+        assert len(last.run_length_posterior) <= last.most_likely_run_length + 5
+        assert len(last.run_length_posterior) < last.step
+        assert sum(last.run_length_posterior) == pytest.approx(1.0, abs=1e-8)
 
 
 # ---------------------------------------------------------------------------
@@ -420,3 +449,75 @@ class TestIntegrationCustomModel:
         assert len(results) == 5
         for r in results:
             assert 0 <= r.changepoint_prob <= 1
+        with pytest.raises(TypeError, match="predictive_mean"):
+            d.predictive_mean()
+
+
+# ---------------------------------------------------------------------------
+# Constant-hazard identity, prior scale, mixture predictive
+# ---------------------------------------------------------------------------
+
+
+class TestChangepointProbIdentity:
+    """P(r=0) equals a constant hazard until truncation."""
+
+    def test_equals_hazard_on_every_step(self) -> None:
+        rng = np.random.default_rng(0)
+        results = Detector(hazard=ConstantHazard(rate=1 / 50)).fit(rng.normal(0, 1, 40))
+        for result in results:
+            assert result.changepoint_prob == pytest.approx(1 / 50)
+
+
+class TestPriorScale:
+    """Default prior misses a shift far from 0; from_scale does not."""
+
+    def test_from_scale_detects_shift_default_misses(self) -> None:
+        rng = np.random.default_rng(0)
+        series = np.concatenate([rng.normal(100, 1, 200), rng.normal(105, 1, 150)])
+        assert detect_changepoints(Detector().fit(series)) == []
+        found = detect_changepoints(
+            Detector(model=GaussianModel.from_scale(100.0, 1.0)).fit(series)
+        )
+        assert len(found) == 1
+        assert abs(found[0].step - 200) <= 8
+
+
+class TestMixturePredictive:
+    """One-step filtering predictive."""
+
+    def test_prior_log_prob_matches_model(self) -> None:
+        detector = Detector()
+        model = GaussianModel()
+        x = 0.5
+        assert detector.predictive_log_prob(x) == pytest.approx(
+            float(model.log_predictive_prob(x)[0])
+        )
+
+    def test_default_variance_is_infinite(self) -> None:
+        detector = Detector()
+        assert detector.predictive_mean() == pytest.approx(0.0)
+        assert detector.predictive_variance() == float("inf")
+
+    def test_finite_variance_when_prior_df_exceeds_two(self) -> None:
+        detector = Detector(model=GaussianModel.from_scale(0.0, 1.0, alpha=2.0))
+        assert detector.predictive_variance() == pytest.approx(2.0)
+
+    def test_student_prior_mean_undefined(self) -> None:
+        detector = Detector(model=StudentTModel())
+        assert np.isnan(detector.predictive_mean())
+
+    def test_mean_tracks_regime(self) -> None:
+        rng = np.random.default_rng(0)
+        series = rng.normal(5, 1, 80)
+        detector = Detector(model=GaussianModel.from_scale(0.0, 1.0, alpha=2.0))
+        detector.fit(series)
+        assert detector.predictive_mean() == pytest.approx(5.0, abs=0.5)
+        assert math.isfinite(detector.predictive_variance())
+        near = detector.predictive_log_prob(5.0)
+        far = detector.predictive_log_prob(30.0)
+        assert near > far
+
+    def test_non_finite_predictive_input_raises(self) -> None:
+        detector = Detector()
+        with pytest.raises(ValueError):
+            detector.predictive_log_prob(float("nan"))

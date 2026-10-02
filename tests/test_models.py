@@ -146,6 +146,47 @@ class TestGaussianModel:
         m.validate_observation(-1e10)
         m.validate_observation(1e10)
 
+    def test_from_scale_matches_default_constructor(self) -> None:
+        default = GaussianModel()
+        built = GaussianModel.from_scale(0.0, np.sqrt(2.0))
+        np.testing.assert_allclose(
+            default.log_predictive_prob(0.3),
+            built.log_predictive_prob(0.3),
+        )
+
+    def test_from_scale_rejects_non_positive_scale(self) -> None:
+        with pytest.raises(ValueError, match="scale"):
+            GaussianModel.from_scale(0.0, 0.0)
+
+    def test_from_scale_rejects_non_finite_mean(self) -> None:
+        with pytest.raises(ValueError, match="mean"):
+            GaussianModel.from_scale(float("nan"), 1.0)
+
+    def test_welford_matches_centered_sum_of_squares_at_large_magnitude(self) -> None:
+        """sum(x^2) - sum(x)^2/n collapses around 1e8; Welford must not."""
+        offsets = np.array([0.0, 1.0, -1.5, 0.5, 2.0])
+        level = 1e9
+        xs = level + offsets
+        model = GaussianModel(mu_0=level, kappa=1.0, alpha=1.0, beta=1.0)
+        for x in xs:
+            model.update(float(x))
+        # Longest hypothesis has seen every point. Its predictive must
+        # match a Student-t built from the centered sum of squares.
+        n = float(len(xs))
+        mean = float(np.mean(xs))
+        ss = float(np.sum((xs - mean) ** 2))
+        kappa_n = 1.0 + n
+        mu_n = (1.0 * level + n * mean) / kappa_n
+        alpha_n = 1.0 + n / 2.0
+        beta_n = 1.0 + 0.5 * ss + 1.0 * n * (mean - level) ** 2 / (2.0 * kappa_n)
+        df = 2.0 * alpha_n
+        scale = np.sqrt(beta_n * (kappa_n + 1.0) / (alpha_n * kappa_n))
+        expected = student_t.logpdf(level + 0.25, df=df, loc=mu_n, scale=scale)
+        got = model.log_predictive_prob(level + 0.25)[-1]
+        np.testing.assert_allclose(got, expected, rtol=1e-6, atol=1e-6)
+        assert model.predictive_variance()[-1] > 0.0
+        assert np.isfinite(model.predictive_variance()[-1])
+
 
 # ---------------------------------------------------------------------------
 # StudentTModel
@@ -153,7 +194,7 @@ class TestGaussianModel:
 
 
 class TestStudentTModel:
-    """Tests for StudentTModel (robust-prior preset of GaussianModel)."""
+    """Tests for StudentTModel (heavier-prior preset of GaussianModel)."""
 
     def test_is_subclass_of_gaussian(self) -> None:
         assert issubclass(StudentTModel, GaussianModel)
@@ -194,6 +235,20 @@ class TestStudentTModel:
         s = StudentTModel()
         x_extreme = 10.0
         assert s.log_predictive_prob(x_extreme)[0] > g.log_predictive_prob(x_extreme)[0]
+
+    def test_from_scale_rejects_bad_inputs(self) -> None:
+        with pytest.raises(ValueError, match="scale"):
+            StudentTModel.from_scale(0.0, -1.0)
+        with pytest.raises(ValueError, match="mean"):
+            StudentTModel.from_scale(float("inf"), 1.0)
+
+    def test_from_scale_matches_default(self) -> None:
+        preset = StudentTModel()
+        built = StudentTModel.from_scale(0.0, 2.0)
+        np.testing.assert_allclose(
+            preset.log_predictive_prob(1.5),
+            built.log_predictive_prob(1.5),
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -304,3 +359,13 @@ class TestPoissonModel:
     def test_validate_observation_accepts_integer_float(self) -> None:
         m = PoissonModel()
         m.validate_observation(3.0)  # integer-valued float is fine
+
+    def test_predictive_moments_match_negative_binomial(self) -> None:
+        m = PoissonModel(alpha=2.0, beta=1.0)
+        # Prior: mean = alpha/beta = 2, var = alpha*(beta+1)/beta^2 = 4
+        np.testing.assert_allclose(m.predictive_mean(), [2.0])
+        np.testing.assert_allclose(m.predictive_variance(), [4.0])
+        m.update(5.0)
+        # Fresh run is unchanged; the run that saw 5 has alpha=7, beta=2
+        np.testing.assert_allclose(m.predictive_mean(), [2.0, 7.0 / 2.0])
+        np.testing.assert_allclose(m.predictive_variance(), [4.0, 7.0 * 3.0 / 4.0])

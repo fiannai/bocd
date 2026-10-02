@@ -14,6 +14,10 @@ class ConstantHazard:
     """Constant hazard: P(changepoint | run_length) = rate for all run lengths.
 
     Parameter: rate = 1 / expected_run_length. Default 1/200.
+
+    Under this hazard, the posterior mass on run length 0 equals ``rate``
+    at every step until truncation. Regime changes show up in the rest
+    of the run-length posterior, not in that single bin.
     """
 
     def __init__(self, rate: float = 1 / 200) -> None:

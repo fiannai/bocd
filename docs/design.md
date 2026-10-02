@@ -17,7 +17,7 @@ Primary consumer: GLADyS memory service (episode boundary detection). But the li
 | Decision | Choice | Rationale |
 | --- | --- | --- |
 | Scope | General-purpose, no GLADyS awareness | Broader adoption; GLADyS imports it like any other consumer |
-| Observation models (v1) | Gaussian + Student-t + Poisson | Covers continuous, outlier-robust, and count/rate data |
+| Observation models (v1) | Gaussian + Student-t + Poisson | Covers continuous, heavier-tailed prior, and count/rate data |
 | Hazard functions (v1) | Constant + user callable | Easy default; any callable satisfies the Protocol for custom hazards |
 | API shape | Streaming + batch | Streaming for production; batch for notebooks/research |
 | Dependencies | numpy + scipy | scipy.stats gives clean model implementations; universal in data science |
@@ -134,7 +134,7 @@ Sufficient statistics are numpy arrays indexed by run length, not object-per-hyp
 
 | Model | Sufficient Stats | Predictive Distribution |
 | --- | --- | --- |
-| Gaussian (NIG) | `sum_x`, `sum_x2`, `count` — each shape `(t,)` | Student-t: df=2α, loc=μ_n, scale=sqrt(β_n·(κ_n+1)/(α_n·κ_n)) — scale is the scipy-compatible std-dev parameter (see NIG update equations below) |
+| Gaussian (NIG) | `mean`, `m2`, `count` — each shape `(t,)`. `m2` is Welford's second moment | Student-t: df=2α, loc=μ_n, scale=sqrt(β_n·(κ_n+1)/(α_n·κ_n)) — scale is the scipy-compatible scale parameter (see NIG update equations below) |
 | Student-t (preset) | Same NIG stats via delegation to GaussianModel, default α=0.5 (df=1, Cauchy-like tails) | Student-t with heavier tails than Gaussian default |
 | Poisson (Gamma) | `sum_x`, `count` — each shape `(t,)` | Negative Binomial: r=α+sum_x, p=(β+count)/(β+count+1) |
 
@@ -149,14 +149,15 @@ After observing x, the Normal-Inverse-Gamma hyperparameters update as:
 - `α_n = α + n/2` — degrees of freedom increase
 - `β_n = β + ½ · Σ(xᵢ − x̄)² + (κ · n · (x̄ − μ₀)²) / (2 · (κ + n))` — posterior scale absorbs data variance and prior-data conflict
 
-In the vectorized implementation, these are computed from sufficient statistics (`sum_x`, `sum_x2`, `count`) per run-length hypothesis. The predictive Student-t uses `scipy.stats.t(df=2α_n, loc=μ_n, scale=sqrt(β_n·(κ_n+1)/(α_n·κ_n)))`.
+In the vectorized implementation, these are computed from sufficient statistics (`mean`, `m2`, `count`) per run-length hypothesis. `m2` is updated with Welford's recurrence so the sum of squared deviations stays accurate when observations are large. The predictive Student-t uses `scipy.stats.t(df=2α_n, loc=μ_n, scale=sqrt(β_n·(κ_n+1)/(α_n·κ_n)))`.
+
+`GaussianModel.from_scale(mean, scale)` sets `mu_0` and `beta` so the prior predictive scale equals `scale`. The zero-argument model is the special case `mean=0`, `scale=sqrt(2)`. Defaults assume order-1 data: a series centered far from `mu_0` inflates `beta` by about `kappa * (x̄ - mu_0)^2 / 2`, and a later mean shift stays hidden until that constant is small next to the residual sum of squares.
 
 ### Numerical Stability
 
 - **Log-space arithmetic** throughout — all probability computations use log-probabilities to avoid underflow on long series. `scipy.special.logsumexp` for normalization.
-- **Run-length truncation** — optional `max_run_length` parameter on `Detector` caps both the joint distribution and model sufficient statistics after each step. Hypotheses beyond the limit are discarded: Detector truncates the joint array, calls `model.truncate(max_run_length)` to slice sufficient-statistics arrays to match, then renormalizes. The core `step()` function is unaware of truncation — this is the Detector layer's responsibility. Essential for infinite streams. When truncation is active, per-step time and memory are O(max_run_length) rather than O(t).
+- **Run-length truncation** — two optional controls on `Detector`, applied after `step()`. The core function is unaware of them. `prune_threshold` discards a suffix of long run lengths whose total mass is below the threshold (Adams & MacKay's tail prune) and renormalizes. That shrinks state after a changepoint; it does not bound a regime whose mode is the longest run. `max_run_length` (>= 2) is the memory cap: probability for run lengths at or beyond the cap is folded into the last kept bin, and `model.truncate` keeps that bin's statistics (the most recent `max_run_length - 1` points). Folding is an approximation — those longer runs do not share one statistic vector — and it preserves the belief that the current regime is already long. Per-step time and memory are O(max_run_length) when the cap is set.
 - **Minimum probability floor** — small epsilon prevents log(0) in edge cases.
-- **Sufficient statistics overflow** — sufficient statistics (`sum_x`, `sum_x2`, `count`) are accumulated in linear space. For GaussianModel, `sum_x2` can overflow float64 for observations with magnitude exceeding ~1e154. This is a known limitation; Welford's online algorithm for numerically stable variance is a potential future enhancement.
 
 ### Input Validation
 
@@ -299,7 +300,7 @@ Normal-Inverse-Gamma conjugate prior. Default hyperparameters: `mu_0=0.0` (prior
 
 ### StudentTModel
 
-A robust-prior preset of `GaussianModel`, not a distinct model family. Implemented as a subclass of `GaussianModel` that overrides `alpha` to 0.5. Accepts the same constructor parameters as `GaussianModel` (`mu_0`, `kappa`, `alpha`, `beta`) but defaults `alpha=0.5` (giving df=1, Cauchy-like tails) vs. Gaussian's default `alpha=1.0` (df=2). The lower degrees of freedom produce heavier tails, making the predictive distribution less sensitive to outliers and reducing false changepoint detections from extreme observations. No duplicate conjugate math — `StudentTModel` inherits or delegates everything from `GaussianModel`. Equivalent to `GaussianModel(alpha=0.5)` — provided as a separate importable name (`from bocd.models import StudentTModel`) for discoverability. Use for data with occasional spikes (network traffic, sensor data).
+A heavier-prior preset of `GaussianModel`, not a distinct likelihood. Implemented as a subclass that defaults `alpha` to 0.5. Predictive degrees of freedom are `1 + n` on a run of length `n` (`GaussianModel` is `2 + n`). Tails are heavier at the start of a run and approach a Gaussian as the run grows, so a spike inside a long regime is still evidence for a changepoint. No duplicate conjugate math. Equivalent to `GaussianModel(alpha=0.5)`.
 
 ### PoissonModel
 
@@ -334,7 +335,7 @@ detector = Detector(model=m, hazard=lambda rl: 1 - np.exp(-rl / 100))
 ```python
 @dataclass(frozen=True, slots=True)
 class Result:
-    changepoint_prob: float        # P(run_length = 0)
+    changepoint_prob: float        # P(run_length = 0). Equals a constant hazard on every untruncated step.
     run_length_posterior: NDArray   # Full distribution — shape (step+2,) when unbounded, min(step+2, max_run_length) when truncated
     most_likely_run_length: int    # argmax of posterior
     step: int                      # 0-indexed observation number
@@ -420,14 +421,14 @@ class Detector:
 - **`fit()` returns `list[Result]`** — standard Python type, works with all existing tooling.
 - **`fit()` calls `step()` in a loop** — resets state, then calls `_core.step()` for each observation, applying truncation per step and wrapping each step's output in a `Result`. The core `run()` function exists as a lower-level batch API returning raw arrays for users who want to avoid `Result` overhead — it does not reset or truncate, so callers must provide a fresh model.
 - **`run_length_posterior` property returns a copy** — prevents accidental mutation of internal state. `Result.run_length_posterior` is an independent copy created at construction time — safe to store, but users should treat it as read-only by convention (frozen dataclass prevents attribute reassignment but not array mutation).
-- **No `predict()` method** — BOCD detects, it doesn't forecast. Keeps the library focused.
+- **Mixture predictive, not a point forecast** — `predictive_log_prob`, `predictive_mean`, and `predictive_variance` mix each run length's predictive with the current posterior (Adams & MacKay equation 1). There is no separate `predict()` that returns future changepoints. The default Gaussian prior has 2 degrees of freedom, so `predictive_variance()` is infinite until `alpha > 1`.
 
 ### Usage Examples
 
 **Streaming (production):**
 
 ```python
-from bocd import Detector
+from bocd import ChangepointStream, Detector
 from bocd.models import PoissonModel
 from bocd.hazards import ConstantHazard
 
@@ -436,20 +437,22 @@ detector = Detector(
     hazard=ConstantHazard(rate=1/100),
     max_run_length=500,
 )
+alarm = ChangepointStream()
 
 for event in event_stream:
     result = detector.update(event.density)
-    if result.changepoint_prob > 0.6:
-        create_episode_boundary(confidence=result.changepoint_prob)
+    boundary = alarm.push(result)
+    if boundary is not None:
+        create_episode_boundary(step=boundary.step)
 ```
 
 **Batch (notebook):**
 
 ```python
-from bocd import Detector
+from bocd import Detector, detect_changepoints
 
 results = Detector().fit(time_series)
-changepoints = [r.step for r in results if r.changepoint_prob > 0.5]
+changepoints = [cp.step for cp in detect_changepoints(results)]
 ```
 
 ## Testing Strategy
@@ -609,7 +612,6 @@ Candidates for post-v1 releases. Not in scope for the initial implementation but
 - **Serialization** — `Detector.to_dict()` / `Detector.from_dict()` for saving and restoring detector state across process restarts.
 - **Second built-in hazard** — a `LogisticHazard` or `WeibullHazard` demonstrating run-length-dependent hazard design and broadening the built-in offering.
 - **Multivariate extension** — observation models accepting vector inputs.
-- **Welford's algorithm** — numerically stable online variance for GaussianModel, eliminating the `sum_x2` overflow limitation.
 
 **Known limitations:**
 - BOCD is optimized for abrupt regime changes. Gradual drift produces delayed or weak changepoint signals — this is inherent to the algorithm, not a bug.
